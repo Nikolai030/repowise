@@ -37,9 +37,7 @@ _CP_NAMED = re.compile(
     rf"import\s*(?:{_JS_NAME}\s*,\s*)?\{{([^}}]*)\}}\s*from\s*{_CP_MODULE}"
     rf"|(?:const|let|var)\s*\{{([^}}]*)\}}\s*=\s*require\(\s*{_CP_MODULE}\s*\)"
 )
-_CP_REQUIRE_CALL = re.compile(
-    rf"require\(\s*{_CP_MODULE}\s*\)\s*\.\s*exec(?:Sync)?\s*\("
-)
+_CP_REQUIRE_CALL = re.compile(rf"require\(\s*{_CP_MODULE}\s*\)\s*\.\s*exec(?:Sync)?\s*\(")
 _EXEC_EXPORT = re.compile(r"exec(?:Sync)?")
 
 
@@ -58,7 +56,9 @@ def _child_process_exec_calls(source: str, masked: str) -> list[int]:
             parts = re.split(r"\s+as\s+|\s*:\s*", item.strip().removeprefix("type "))
             if parts[0] and _EXEC_EXPORT.fullmatch(parts[0]):
                 functions.add(parts[-1].strip())
-    offsets = [m.start() for m in _CP_REQUIRE_CALL.finditer(source) if not masked[m.start()].isspace()]
+    offsets = [
+        m.start() for m in _CP_REQUIRE_CALL.finditer(source) if not masked[m.start()].isspace()
+    ]
     names = [re.escape(n) for n in namespaces]
     if names:
         receiver = rf"(?<![\w$.])(?:{'|'.join(names)})\s*\.\s*exec(?:Sync)?\s*\("
@@ -201,6 +201,9 @@ def _tls_verify_off_lines(source: str) -> set[int] | None:
     return found
 
 
+_PY_EVAL_FALLBACK = re.compile(r"(?<![\w$.])(?:builtins\s*\.\s*)?eval\s*\(")
+
+
 def _call_findings(file_path: str, source: str, masked: Callable[[], str]) -> list[dict]:
     """Find executable eval/exec calls with AST or bounded lexical fallback.
 
@@ -230,6 +233,10 @@ def _call_findings(file_path: str, source: str, masked: Callable[[], str]) -> li
                     call_name = node.func.id
                 elif isinstance(node.func, ast.Attribute):
                     call_name = node.func.attr
+                    if call_name == "eval" and not (
+                        isinstance(node.func.value, ast.Name) and node.func.value.id == "builtins"
+                    ):
+                        continue
                 else:
                     continue
                 if call_name not in {"eval", "exec"}:
@@ -260,7 +267,14 @@ def _call_findings(file_path: str, source: str, masked: Callable[[], str]) -> li
     for pattern, kind, severity in _CALL_PATTERNS:
         if kind == "exec_call" and not is_python:
             continue  # handled below, gated on child_process
-        for match in pattern.finditer(masked_source):
+        active_pattern = _PY_EVAL_FALLBACK if is_python and kind == "eval_call" else pattern
+        for match in active_pattern.finditer(masked_source):
+            if (
+                is_python
+                and kind == "eval_call"
+                and re.search(r"\.\s*$", masked_source[: match.start()])
+            ):
+                continue
             add(kind, severity, match.start())
 
     if not is_python:
